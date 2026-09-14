@@ -1,0 +1,418 @@
+<script>
+/* ===================== plumbing ===================== */
+const $ = function (id) { return document.getElementById(id); };
+
+function call(fn) {
+  const args = Array.prototype.slice.call(arguments, 1);
+  return new Promise(function (resolve, reject) {
+    google.script.run.withSuccessHandler(resolve).withFailureHandler(reject)[fn].apply(null, args);
+  });
+}
+
+function show(el) { el.classList.remove('hide'); }
+function hide(el) { el.classList.add('hide'); }
+
+function note(el, text, ok) {
+  el.className = 'msg ' + (ok ? 'ok' : 'bad');
+  el.textContent = text;
+  show(el);
+}
+
+function flash(text, ok) {
+  note($('flash'), text, ok);
+  clearTimeout(flash.t);
+  flash.t = setTimeout(function () { hide($('flash')); }, 6000);
+}
+
+function onFail(err) {
+  const m = String(err && err.message ? err.message : err);
+  if (m.indexOf('SESSION_EXPIRED') > -1) { expire(); return true; }
+  flash(m, false);
+  return false;
+}
+
+/* ===================== state ===================== */
+const S = { token: null, user: null, expiresAt: 0, item: null, timer: null, scanner: null, target: null, pin: null };
+
+/* ===================== session ===================== */
+function startSession(res) {
+  S.token = res.token || S.token;
+  S.user = res.user;
+  S.expiresAt = res.expiresAt;
+  sessionStorage.setItem('tok', S.token);
+  $('whoName').textContent = res.user;
+  hide($('loginScreen'));
+  show($('appScreen'));
+  tick();
+  S.timer = setInterval(tick, 1000);
+  $('barcode').focus();
+}
+
+function tick() {
+  const left = Math.max(0, S.expiresAt - Date.now());
+  if (left <= 0) { expire(); return; }
+  const m = Math.floor(left / 60000), s = Math.floor((left % 60000) / 1000);
+  const c = $('clock');
+  c.textContent = m + ':' + (s < 10 ? '0' : '') + s + ' left';
+  c.classList.toggle('warn', left < 5 * 60000);
+}
+
+function expire() {
+  clearInterval(S.timer);
+  stopScanner();
+  S.token = null;
+  sessionStorage.removeItem('tok');
+  ['scanModal', 'closeModal', 'pinModal', 'adminModal', 'pwModal'].forEach(function (id) { hide($(id)); });
+  hide($('appScreen'));
+  show($('expiredModal'));
+}
+
+$('expiredBtn').onclick = function () {
+  hide($('expiredModal'));
+  resetAll();
+  show($('loginScreen'));
+  $('lp').value = '';
+  $('lu').focus();
+};
+
+/* ===================== login ===================== */
+function doLogin() {
+  const u = $('lu').value, p = $('lp').value;
+  $('loginBtn').disabled = true;
+  hide($('loginMsg'));
+  call('login', u, p).then(function (r) {
+    $('loginBtn').disabled = false;
+    if (!r.ok) { note($('loginMsg'), r.message, false); return; }
+    startSession(r);
+  }).catch(function (e) { $('loginBtn').disabled = false; note($('loginMsg'), String(e.message || e), false); });
+}
+
+$('loginBtn').onclick = doLogin;
+$('lp').addEventListener('keydown', function (e) { if (e.key === 'Enter') doLogin(); });
+$('lu').addEventListener('keydown', function (e) { if (e.key === 'Enter') $('lp').focus(); });
+
+$('logoutBtn').onclick = function () {
+  const t = S.token;
+  clearInterval(S.timer);
+  S.token = null;
+  sessionStorage.removeItem('tok');
+  call('logout', t).catch(function () {});
+  resetAll();
+  hide($('appScreen'));
+  show($('loginScreen'));
+  $('lp').value = '';
+};
+
+function resetAll() {
+  $('barcode').value = '';
+  $('carton').value = '';
+  $('qty').value = '1';
+  $('digits').textContent = '0 / 13';
+  $('digits').classList.remove('full');
+  hide($('itemCard'));
+  hide($('workCard'));
+  hide($('flash'));
+  S.item = null;
+}
+
+/* ===================== barcode field ===================== */
+const bc = $('barcode');
+
+bc.addEventListener('input', function () {
+  bc.value = bc.value.replace(/\D/g, '').slice(0, 13);
+  const n = bc.value.length;
+  $('digits').textContent = n + ' / 13';
+  $('digits').classList.toggle('full', n === 13);
+  if (n === 13) lookup(bc.value);
+  else { hide($('itemCard')); hide($('workCard')); S.item = null; }
+});
+
+bc.addEventListener('keydown', function (e) {
+  if (e.key === 'Enter') {
+    if (bc.value.length === 13) lookup(bc.value);
+    else flash('A barcode must be exactly 13 digits. You have ' + bc.value.length + '.', false);
+  }
+});
+
+function lookup(code) {
+  hide($('flash'));
+  call('lookupBarcode', S.token, code).then(function (r) {
+    if (!r.ok) {
+      hide($('itemCard')); hide($('workCard')); S.item = null;
+      flash(r.message, false);
+      return;
+    }
+    S.item = r;
+    $('catNum').textContent = r.catNum || '—';
+    $('catDesc').textContent = r.catDesc || '—';
+    $('itemName').textContent = r.item || '—';
+    $('itemCode').textContent = r.barcode;
+    show($('itemCard'));
+    paintCarton(r);
+    show($('workCard'));
+    $('qty').value = '1';
+  }).catch(onFail);
+}
+
+function paintCarton(r) {
+  const b = $('cartonBanner'), input = $('carton'), btn = $('scanCartonBtn');
+  if (r.openCarton) {
+    b.className = 'banner open';
+    b.innerHTML = '<div><b>Put it in carton ' + esc(r.openCarton) + ' <span class="pill">Open</span></b>' +
+                  'This carton is already collecting category ' + esc(r.catNum) + '.</div>';
+    input.value = r.openCarton;
+    input.disabled = true;
+    btn.disabled = true;
+    btn.style.opacity = .4;
+  } else {
+    b.className = 'banner new';
+    b.innerHTML = '<div><b>No open carton for category ' + esc(r.catNum) + '</b>' +
+                  'Take an empty carton, then scan or type its number to open it.</div>';
+    input.value = '';
+    input.disabled = false;
+    btn.disabled = false;
+    btn.style.opacity = 1;
+    setTimeout(function () { input.focus(); }, 50);
+  }
+}
+
+function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]; }); }
+
+/* ===================== quantity ===================== */
+$('qty').addEventListener('input', function () { this.value = this.value.replace(/\D/g, '').slice(0, 6); });
+$('qtyPlus').onclick = function () { $('qty').value = (Number($('qty').value || 0) + 1); };
+$('qtyMinus').onclick = function () { $('qty').value = Math.max(1, Number($('qty').value || 1) - 1); };
+
+/* ===================== approve ===================== */
+$('approveBtn').onclick = function () {
+  if (!S.item) return;
+  const carton = $('carton').value.trim();
+  const qty = Number($('qty').value);
+  if (!carton) { flash('Scan or type the carton number first.', false); $('carton').focus(); return; }
+  if (!(qty > 0)) { flash('Quantity must be above 0.', false); return; }
+
+  const btn = this;
+  btn.disabled = true;
+  call('submitScan', S.token, { barcode: S.item.barcode, carton: carton, quantity: qty })
+    .then(function (r) {
+      btn.disabled = false;
+      if (!r.ok) { flash(r.message, false); return; }
+      flash(r.message, true);
+      resetAll();
+      $('barcode').focus();
+    })
+    .catch(function (e) { btn.disabled = false; onFail(e); });
+};
+
+/* ===================== camera scanning ===================== */
+function openScanner(target) {
+  S.target = target;
+  show($('scanModal'));
+  $('scanHint').className = 'msg ok';
+  $('scanHint').textContent = 'Hold the code steady inside the frame.';
+
+  const formats = [
+    Html5QrcodeSupportedFormats.EAN_13,
+    Html5QrcodeSupportedFormats.EAN_8,
+    Html5QrcodeSupportedFormats.UPC_A,
+    Html5QrcodeSupportedFormats.UPC_E,
+    Html5QrcodeSupportedFormats.CODE_128,
+    Html5QrcodeSupportedFormats.CODE_39,
+    Html5QrcodeSupportedFormats.ITF,
+    Html5QrcodeSupportedFormats.QR_CODE
+  ];
+
+  S.scanner = new Html5Qrcode('reader', { formatsToSupport: formats, verbose: false });
+  S.scanner.start(
+    { facingMode: 'environment' },
+    { fps: 12, qrbox: { width: 280, height: 170 }, aspectRatio: 1.4 },
+    onDecoded,
+    function () {}
+  ).catch(function (e) {
+    $('scanHint').className = 'msg bad';
+    $('scanHint').textContent = 'The camera did not start: ' + e + '. Type the number instead.';
+  });
+}
+
+function onDecoded(text) {
+  const raw = String(text).trim();
+  if (S.target === 'barcode') {
+    const d = raw.replace(/\D/g, '');
+    if (d.length !== 13) {
+      $('scanHint').className = 'msg bad';
+      $('scanHint').textContent = 'That code has ' + d.length + ' digits. Item barcodes have 13.';
+      return;
+    }
+    stopScanner();
+    bc.value = d;
+    bc.dispatchEvent(new Event('input'));
+  } else {
+    stopScanner();
+    $('carton').value = raw;
+  }
+}
+
+function stopScanner() {
+  hide($('scanModal'));
+  if (!S.scanner) return;
+  const s = S.scanner;
+  S.scanner = null;
+  s.stop().then(function () { s.clear(); }).catch(function () {});
+}
+
+$('scanBarcodeBtn').onclick = function () { openScanner('barcode'); };
+$('scanCartonBtn').onclick = function () { if (!this.disabled) openScanner('carton'); };
+$('scanClose').onclick = stopScanner;
+$('scanCancel').onclick = stopScanner;
+
+/* ===================== close carton ===================== */
+$('closeCartonBtn').onclick = function () {
+  show($('closeModal'));
+  hide($('closeMsg'));
+  $('openList').innerHTML = '<div class="tile">Loading open cartons…</div>';
+  call('listOpenCartons', S.token).then(function (r) {
+    if (!r.cartons.length) {
+      $('openList').innerHTML = '<div class="tile">No cartons are open right now.</div>';
+      return;
+    }
+    $('openList').innerHTML = '';
+    r.cartons.forEach(function (c) {
+      const b = document.createElement('button');
+      b.className = 'tile';
+      b.innerHTML = '<div><div class="t1">' + esc(c.carton) + '</div>' +
+                    '<div class="t2">Category ' + esc(c.catNum) + ' · ' + esc(c.catDesc) + '</div></div>' +
+                    '<div class="spacer">' + c.qty + ' pcs<br>' + c.lines + ' lines</div>';
+      b.onclick = function () { confirmClose(c.carton); };
+      $('openList').appendChild(b);
+    });
+  }).catch(onFail);
+};
+
+function confirmClose(carton) {
+  if (!confirm('Close carton ' + carton + '? No more items can be added to it.')) return;
+  call('closeCarton', S.token, carton).then(function (r) {
+    note($('closeMsg'), r.message, r.ok);
+    if (r.ok) {
+      $('closeCartonBtn').click();
+      if (S.item) lookup(S.item.barcode);
+    }
+  }).catch(onFail);
+}
+
+$('closeModalX').onclick = function () { hide($('closeModal')); };
+$('closeCancel').onclick = function () { hide($('closeModal')); };
+
+/* ===================== admin: shield + pin ===================== */
+$('shieldBtn').addEventListener('dblclick', openPin);
+let tapCount = 0, tapTimer = null;
+$('shieldBtn').addEventListener('touchend', function (e) {
+  e.preventDefault();
+  tapCount++;
+  clearTimeout(tapTimer);
+  if (tapCount >= 2) { tapCount = 0; openPin(); return; }
+  tapTimer = setTimeout(function () { tapCount = 0; }, 400);
+});
+
+function openPin() {
+  show($('pinModal'));
+  hide($('pinMsg'));
+  $('pinInput').value = '';
+  setTimeout(function () { $('pinInput').focus(); }, 60);
+}
+
+$('pinInput').addEventListener('input', function () {
+  this.value = this.value.replace(/\D/g, '').slice(0, 4);
+  if (this.value.length === 4) submitPin();
+});
+$('pinGo').onclick = submitPin;
+$('pinX').onclick = function () { hide($('pinModal')); };
+
+function submitPin() {
+  const pin = $('pinInput').value;
+  if (pin.length !== 4) { note($('pinMsg'), 'The code is 4 digits.', false); return; }
+  call('adminLoad', S.token, pin).then(function (r) {
+    if (!r.ok) { note($('pinMsg'), r.message, false); $('pinInput').value = ''; return; }
+    S.pin = pin;
+    hide($('pinModal'));
+    paintAdmin(r);
+    show($('adminModal'));
+  }).catch(onFail);
+}
+
+/* ===================== admin hub ===================== */
+function paintAdmin(r) {
+  hide($('adminMsg'));
+  $('userList').innerHTML = '';
+  r.users.forEach(function (u) {
+    const b = document.createElement('button');
+    b.className = 'tile';
+    b.innerHTML = '<div><div class="t1">' + esc(u.username) + '</div><div class="t2">Tap to change the password</div></div>' +
+                  '<div class="spacer">' + '•'.repeat(Math.min(String(u.password).length, 10)) + '</div>';
+    b.onclick = function () { openPw(u.username); };
+    $('userList').appendChild(b);
+  });
+
+  const sel = $('admHour');
+  if (!sel.options.length) {
+    for (let h = 0; h < 24; h++) {
+      const o = document.createElement('option');
+      o.value = h;
+      o.textContent = (h < 10 ? '0' : '') + h + ':00';
+      sel.appendChild(o);
+    }
+  }
+  sel.value = String(parseInt(r.hour, 10) || 18);
+  $('admEmail').value = r.email || '';
+  $('tzNote').textContent = 'Times follow the spreadsheet timezone (' + r.timezone + '). Days with no scans are skipped.';
+}
+
+$('adminX').onclick = function () { hide($('adminModal')); S.pin = null; };
+
+$('addUserBtn').onclick = function () {
+  call('adminAddUser', S.token, S.pin, $('newUser').value, $('newPass').value).then(function (r) {
+    note($('adminMsg'), r.message, r.ok);
+    if (r.ok) {
+      $('newUser').value = ''; $('newPass').value = '';
+      call('adminLoad', S.token, S.pin).then(function (d) { if (d.ok) paintAdmin(d); });
+    }
+  }).catch(onFail);
+};
+
+$('saveReportBtn').onclick = function () {
+  call('adminSaveReport', S.token, S.pin, $('admEmail').value, $('admHour').value).then(function (r) {
+    note($('adminMsg'), r.message, r.ok);
+  }).catch(onFail);
+};
+
+/* ===================== password change ===================== */
+function openPw(username) {
+  $('pwUser').textContent = username;
+  $('pwNew').value = '';
+  hide($('pwMsg'));
+  show($('pwModal'));
+  setTimeout(function () { $('pwNew').focus(); }, 60);
+}
+
+$('pwX').onclick = function () { hide($('pwModal')); };
+
+$('pwSave').onclick = function () {
+  const user = $('pwUser').textContent;
+  call('adminSetPassword', S.token, S.pin, user, $('pwNew').value).then(function (r) {
+    note($('pwMsg'), r.message, r.ok);
+    if (r.ok) {
+      setTimeout(function () { hide($('pwModal')); }, 900);
+      call('adminLoad', S.token, S.pin).then(function (d) { if (d.ok) paintAdmin(d); });
+    }
+  }).catch(onFail);
+};
+
+/* ===================== resume on reload ===================== */
+(function () {
+  const t = sessionStorage.getItem('tok');
+  if (!t) return;
+  call('resume', t).then(function (r) {
+    if (r.ok) { S.token = t; startSession(r); }
+    else sessionStorage.removeItem('tok');
+  }).catch(function () { sessionStorage.removeItem('tok'); });
+})();
+</script>
