@@ -6,7 +6,7 @@
 <title>Sorting Scanner</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.8/html5-qrcode.min.js"></script>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@400;500;600;700&family=Heebo:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap');
 
   :root{
     --ink:#0C141D; --panel:#16212D; --panel-2:#1E2C3A; --line:#2B3C4D;
@@ -80,7 +80,8 @@
   }
   button.primary:disabled{opacity:.45;cursor:not-allowed}
   #status{font-size:14px;color:var(--go);text-align:center;margin-top:10px;min-height:18px;font-weight:600}
-  .digits{font-size:13px;color:var(--muted);text-align:right;margin:-4px 0 10px}
+  .digits{font-size:13px;color:var(--muted);text-align:end;margin:-4px 0 10px}
+  body[dir="rtl"]{font-family:'Heebo','Barlow Semi Condensed',sans-serif}
   @media (prefers-reduced-motion:reduce){.scan-line{animation:none;top:49%}}
 </style>
 </head>
@@ -130,16 +131,59 @@
   const params   = new URLSearchParams(window.location.search);
   const targetId = params.get('target') || 'barcode';
   const mode     = params.get('mode') === 'carton' ? 'carton' : 'item';
+  const lang     = params.get('lang') === 'he' ? 'he' : 'en';
+
+  const T = {
+    en: {
+      titleItem:'Scan item barcode', titleCarton:'Scan carton number',
+      subItem:'13 digits', subCarton:'up to 12 digits',
+      phItem:'13 digits', phCarton:'carton number',
+      hint:'Line the barcode up inside the frame',
+      manual:'Or type it in', use:'Use this number', sent:'Sent. Closing…',
+      noDigits:'No digits in that code.',
+      short:'Too short ({n}/{m}) — keep scanning.',
+      longItem:'Too long ({n}/{m}) — not an item barcode.',
+      longCarton:'Too long ({n} digits). A carton number is {m} at most — that looks like an item barcode.',
+      noCam:'No camera on this device — type the number below.',
+      denied:'Camera permission was refused. Allow it in the address bar and reload, or type the number below.',
+      busy:'Another app is using the camera. Close it and reload, or type the number below.',
+      failed:'The camera did not start. Type the number below.'
+    },
+    he: {
+      titleItem:'סריקת ברקוד פריט', titleCarton:'סריקת מספר קרטון',
+      subItem:'13 ספרות', subCarton:'עד 12 ספרות',
+      phItem:'13 ספרות', phCarton:'מספר קרטון',
+      hint:'יישר את הברקוד בתוך המסגרת',
+      manual:'או הקלד ידנית', use:'השתמש במספר הזה', sent:'נשלח. סוגר…',
+      noDigits:'אין ספרות בקוד הזה.',
+      short:'קצר מדי ({n}/{m}) — המשך לסרוק.',
+      longItem:'ארוך מדי ({n}/{m}) — זה לא ברקוד פריט.',
+      longCarton:'ארוך מדי ({n} ספרות). מספר קרטון הוא עד {m} — זה נראה כמו ברקוד פריט.',
+      noCam:'אין מצלמה במכשיר הזה — הקלד את המספר למטה.',
+      denied:'הרשאת המצלמה נדחתה. אשר אותה בשורת הכתובת ורענן, או הקלד את המספר למטה.',
+      busy:'אפליקציה אחרת משתמשת במצלמה. סגור אותה ורענן, או הקלד את המספר למטה.',
+      failed:'המצלמה לא הופעלה. הקלד את המספר למטה.'
+    }
+  };
+
+  const L = T[lang];
+  function tr(key, p) {
+    let s = L[key];
+    if (p) Object.keys(p).forEach(function (k) { s = s.split('{' + k + '}').join(p[k]); });
+    return s;
+  }
+  if (lang === 'he') { document.body.dir = 'rtl'; document.documentElement.lang = 'he'; }
 
   // Item barcodes are exactly 13 digits. Carton numbers are 1 to 12 digits.
   const LIMIT = mode === 'item' ? 13 : 12;
   const EXACT = mode === 'item';
 
-  document.getElementById('title').firstChild.nodeValue =
-    mode === 'item' ? 'Scan item barcode' : 'Scan carton number';
-  document.getElementById('subtitle').innerText =
-    mode === 'item' ? '13 digits' : 'up to 12 digits';
-  document.getElementById('manualInput').placeholder = mode === 'item' ? '13 digits' : 'carton number';
+  document.getElementById('title').firstChild.nodeValue = mode === 'item' ? L.titleItem : L.titleCarton;
+  document.getElementById('subtitle').innerText        = mode === 'item' ? L.subItem   : L.subCarton;
+  document.getElementById('manualInput').placeholder   = mode === 'item' ? L.phItem    : L.phCarton;
+  document.getElementById('hint').innerText   = L.hint;
+  document.getElementById('manualLabel').innerText = L.manual;
+  document.getElementById('useBtn').innerText  = L.use;
   document.getElementById('manualInput').maxLength = LIMIT;
   document.getElementById('digits').innerText = '0 / ' + LIMIT;
 
@@ -155,7 +199,7 @@
       // the source field and its own expected origin on arrival.
       window.opener.postMessage({ source: 'sorting-scanner', target: targetId, value: value }, '*');
     }
-    document.getElementById('status').innerText = 'Sent. Closing…';
+    document.getElementById('status').innerText = L.sent;
     teardown();
     setTimeout(function () { window.close(); }, 400);
   }
@@ -181,13 +225,12 @@
   }
 
   function rejectText(d) {
-    if (!d.length) return 'No digits in that code.';
+    if (!d.length) return tr('noDigits');
     if (EXACT) {
-      return d.length < LIMIT
-        ? 'Too short (' + d.length + '/' + LIMIT + ') — keep scanning.'
-        : 'Too long (' + d.length + '/' + LIMIT + ') — not an item barcode.';
+      return d.length < LIMIT ? tr('short',    { n: d.length, m: LIMIT })
+                              : tr('longItem', { n: d.length, m: LIMIT });
     }
-    return 'Too long (' + d.length + ' digits). A carton number is ' + LIMIT + ' at most — that looks like an item barcode.';
+    return tr('longCarton', { n: d.length, m: LIMIT });
   }
 
   /* ---------- beeps, built in WebAudio so nothing extra is hosted ---------- */
@@ -271,10 +314,10 @@
 
   function describe(e) {
     const s = String((e && e.name) || '') + String((e && e.message) || e);
-    if (/NotFound|OverconstrainedError|device not found/i.test(s)) return 'No camera on this device — type the number below.';
-    if (/NotAllowed|Permission|denied/i.test(s))                  return 'Camera permission was refused. Allow it in the address bar and reload, or type the number below.';
-    if (/NotReadable|TrackStart|Abort/i.test(s))                  return 'Another app is using the camera. Close it and reload, or type the number below.';
-    return 'The camera did not start. Type the number below.';
+    if (/NotFound|OverconstrainedError|device not found/i.test(s)) return L.noCam;
+    if (/NotAllowed|Permission|denied/i.test(s))                  return L.denied;
+    if (/NotReadable|TrackStart|Abort/i.test(s))                  return L.busy;
+    return L.failed;
   }
 
   function start() {
